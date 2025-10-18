@@ -1,4 +1,5 @@
 <?php
+
 namespace PunktDe\Archivist;
 
 /*
@@ -9,14 +10,21 @@ namespace PunktDe\Archivist;
  * source code.
  */
 
-use Neos\ContentRepository\Domain\Repository\NodeDataRepository;
-use Neos\Eel\FlowQuery\FlowQuery;
+use Neos\ContentRepository\Core\CommandHandler\CommandInterface;
+use Neos\ContentRepository\Core\CommandHandler\Commands;
+use Neos\ContentRepository\Core\DimensionSpace\OriginDimensionSpacePoint;
+use Neos\ContentRepository\Core\Feature\NodeMove\Command\MoveNodeAggregate;
+use Neos\ContentRepository\Core\Feature\NodeMove\Dto\RelationDistributionStrategy;
+use Neos\ContentRepository\Core\NodeType\NodeTypeManager;
+use Neos\ContentRepository\Core\Projection\ContentGraph\ContentSubgraphInterface;
+use Neos\ContentRepository\Core\Projection\ContentGraph\Filter\FindClosestNodeFilter;
+use Neos\ContentRepository\Core\Projection\ContentGraph\Node;
+use Neos\ContentRepository\Core\SharedModel\Node\NodeAggregateId;
+use Neos\Eel\Exception;
 use Neos\Flow\Annotations as Flow;
-use Neos\ContentRepository\Domain\Model\NodeInterface;
 use Neos\Flow\Log\ThrowableStorageInterface;
 use Neos\Flow\Log\Utility\LogEnvironment;
 use Neos\Neos\Ui\Domain\Model\Feedback\Operations\UpdateNodeInfo;
-use Neos\Neos\Ui\Domain\Model\Feedback\Operations\UpdateNodePath;
 use Neos\Neos\Ui\Domain\Model\FeedbackCollection;
 use Psr\Log\LoggerInterface;
 use PunktDe\Archivist\Exception\ArchivistConfigurationException;
@@ -26,208 +34,143 @@ use PunktDe\Archivist\Service\SortingService;
 
 class Archivist
 {
-    /**
-     * @Flow\Inject
-     * @var HierarchyService
-     */
-    protected $hierarchyService;
+    #[Flow\Inject]
+    protected HierarchyService $hierarchyService;
 
-    /**
-     * @Flow\Inject
-     * @var EelEvaluationService
-     */
-    protected $eelEvaluationService;
+    #[Flow\Inject]
+    protected EelEvaluationService $eelEvaluationService;
 
-    /**
-     * @flow\Inject
-     * @var NodeDataRepository
-     */
-    protected $nodeDataRepository;
+    #[Flow\Inject]
+    protected SortingService $sortingService;
 
-    /**
-     * @Flow\Inject
-     * @var SortingService
-     */
-    protected $sortingService;
+    #[Flow\Inject]
+    protected LoggerInterface $logger;
 
-    /**
-     * @Flow\Inject
-     * @var LoggerInterface
-     */
-    protected $logger;
+    #[Flow\Inject]
+    protected ThrowableStorageInterface $throwableStorage;
 
-    /**
-     * @Flow\Inject
-     * @var ThrowableStorageInterface
-     */
-    protected $throwableStorage;
+    protected array $nodesInProcessing = [];
 
-    /**
-     * @var array
-     */
-    protected $context;
+    #[Flow\Inject]
+    protected FeedbackCollection $feedbackCollection;
 
-    /**
-     * @var array
-     */
-    protected $organizedNodeParents = [];
-
-    /**
-     * @var array
-     */
-    protected $sortedNodeInstructions = [];
-
-    /**
-     * @var array
-     */
-    protected $nodesInProcessing = [];
-
-    /**
-     * @Flow\Inject
-     * @var FeedbackCollection
-     */
-    protected $feedbackCollection;
-
-    /**
-     * @Flow\Inject
-     * @var AffectedNodeStorage
-     */
-    protected $affectedNodeStorage;
-
-    /**
-     * @param NodeInterface $triggeringNode
-     * @param array $sortingInstructions
-     * @throws ArchivistConfigurationException
-     * @throws \Neos\ContentRepository\Exception\NodeTypeNotFoundException
-     * @throws \Neos\Eel\Exception
-     */
-    public function organizeNode(NodeInterface $triggeringNode, array $sortingInstructions): void
+    public function __construct(protected ?NodeTypeManager $nodeTypeManager = null)
     {
+    }
+
+
+    /**
+     * @throws ArchivistConfigurationException
+     * @throws Exception
+     */
+    public function organizeNode(ContentSubgraphInterface $contentSubgraph, OriginDimensionSpacePoint $originDimensionSpacePoint, NodeAggregateId $triggeringNodeAggregateId, array $sortingInstructions): Commands
+    {
+
+        if (!$triggeringNode = $contentSubgraph->findNodeById($triggeringNodeAggregateId)) {
+            throw new \InvalidArgumentException($triggeringNodeAggregateId);
+        }
+
         if (isset($sortingInstructions['condition'])) {
             $condition = $this->eelEvaluationService->evaluate($sortingInstructions['condition'], ['node' => $triggeringNode]);
             if ($condition !== true) {
-                return;
+                return Commands::createEmpty();
             }
         }
 
+        /** @var Node $affectedNode */
         if (isset($sortingInstructions['affectedNode'])) {
             $affectedNode = $this->eelEvaluationService->evaluate($sortingInstructions['affectedNode'], ['node' => $triggeringNode]);
 
-            if (!($affectedNode instanceof NodeInterface)) {
-                $this->logger->info(sprintf('A node of type %s (%s) triggered node organization but the affectedNode was not found.', $triggeringNode->getNodeType()->getName(), $triggeringNode->getIdentifier()), LogEnvironment::fromMethodName(__METHOD__));
-                return;
+            if (!($affectedNode instanceof Node)) {
+                $this->logger->info(sprintf('A node of type %s (%s) triggered node organization but the affectedNode was not found.', $triggeringNode->nodeTypeName, $triggeringNode->aggregateId), LogEnvironment::fromMethodName(__METHOD__));
+                return Commands::createEmpty();
             }
         } else {
             $affectedNode = $triggeringNode;
         }
+        $this->sendNodeMovedFeedback($affectedNode);
+        $parentNodeAggregateId = $contentSubgraph->findParentNode($affectedNode->aggregateId)->aggregateId;
 
-        $this->lockNodeForProcessing($affectedNode);
-        $this->nodeDataRepository->persistEntities();
+        /** @var Node $affectedNode */
+        $affectedNodeAggregateId = $affectedNode->aggregateId;
 
-        $this->logger->info(sprintf('Organizing node of type %s with path %s', $affectedNode->getNodeType()->getName(), $affectedNode->getPath()), LogEnvironment::fromMethodName(__METHOD__));
-        $context = $this->buildBaseContext($triggeringNode, $sortingInstructions);
+        $this->lockNodeForProcessing($affectedNodeAggregateId);
+
+        $commands = Commands::createEmpty();
+        $moveNodeProperties = [];
+
+        $this->logger->info(sprintf('Organizing node of type %s (%s)', $affectedNode->nodeTypeName, $affectedNode->aggregateId), LogEnvironment::fromMethodName(__METHOD__));
+        $context = $this->buildBaseContext($contentSubgraph, $triggeringNode, $sortingInstructions);
 
         if (isset($sortingInstructions['context']) && is_array($sortingInstructions['context'])) {
             $context = $this->buildCustomContext($context, $sortingInstructions['context']);
         }
 
-        if (isset($sortingInstructions['hierarchy']) && is_array($sortingInstructions['hierarchy'])) {
-            $hierarchyNode = $this->hierarchyService->buildHierarchy($sortingInstructions['hierarchy'], $context, $sortingInstructions['publishHierarchy'] ?? false);
+        if (isset($sortingInstructions['hierarchy']) && is_array($sortingInstructions['hierarchy']) && $this->nodeTypeManager !== null) {
+            [$hierarchyNodeAggregateId, $newCommands] = $this->hierarchyService->buildHierarchy($contentSubgraph, $this->nodeTypeManager, $originDimensionSpacePoint, $sortingInstructions['hierarchy'], $context, $sortingInstructions['publishHierarchy'] ?? false);
+            $commands = $commands->merge($newCommands);
 
-            if ($hierarchyNode !== $affectedNode->getParent() && $hierarchyNode->getNode($affectedNode->getName()) === null) {
-                $this->affectedNodeStorage->addNode($affectedNode);
+            if ($hierarchyNodeAggregateId !== $parentNodeAggregateId) {
+                $this->sendNodeMovedFeedback($contentSubgraph->findNodeById($parentNodeAggregateId));
+                $this->sendNodeMovedFeedback($contentSubgraph->findNodeById($hierarchyNodeAggregateId));
 
-                $oldContextPath = $affectedNode->getContextPath();
-                $affectedNode->moveInto($hierarchyNode);
-                $this->organizedNodeParents[$affectedNode->getIdentifier()] = $affectedNode->getParent();
-                $newContextPath = $affectedNode->getContextPath();
-
-                $this->sendNodeMovedFeedback($hierarchyNode, $affectedNode, $oldContextPath, $newContextPath);
-
-                $this->logger->info(sprintf('Moved affected node %s to path %s', $affectedNode->getNodeType()->getName(), $affectedNode->getPath()), LogEnvironment::fromMethodName(__METHOD__));
+                $moveNodeProperties += ['newParentNodeAggregateId' => $hierarchyNodeAggregateId];
+                $this->logger->info(sprintf('Moved affected node %s to parent %s', $affectedNode->nodeTypeName, $hierarchyNodeAggregateId->value), LogEnvironment::fromMethodName(__METHOD__));
             }
+
+            $parentNodeAggregateId = $hierarchyNodeAggregateId;
         }
 
+        $command = $this->sortNode($contentSubgraph, $parentNodeAggregateId, $affectedNodeAggregateId, $sortingInstructions, $moveNodeProperties);
+
+        return $command ? $commands->append($command) : $commands;
+    }
+
+    public function sortNode(ContentSubgraphInterface $contentSubgraph, NodeAggregateId $parentNodeAggregateId, NodeAggregateId $affectedNodeAggregateId, array $sortingInstructions, array $moveNodeProperties = []): ?MoveNodeAggregate
+    {
         if (isset($sortingInstructions['sorting'])) {
-            $this->sortingService->sortChildren($affectedNode, $sortingInstructions['sorting'], null);
-            $this->sortedNodeInstructions[$affectedNode->getIdentifier()] = $sortingInstructions['sorting'];
+            $moveNodeProperties += $this->sortingService->sortChildren($contentSubgraph, $parentNodeAggregateId, $affectedNodeAggregateId, $sortingInstructions['sorting'], null);
         }
 
-        $this->releaseNodeProcessingLock($affectedNode);
-    }
-
-    /**
-     * On actions like createAfter, the following happens
-     *
-     * 1. save the parent
-     * 2. createInto parent
-     * --- Archivist creates the hierarchy and moves / sorts the node
-     * 3. move node after the parent
-     *
-     * The second move is done to the affected node. When we use a triggered node and an affected node we cannot catch that signal.
-     * So we need to move the node again to the originally calculated position.
-     *
-     * @param NodeInterface $node
-     * @return bool
-     * @throws \Neos\Eel\Exception
-     */
-    public function restorePathIfOrganizedDuringThisRequest(NodeInterface $node): bool
-    {
-        if (isset($this->organizedNodeParents[$node->getIdentifier()])) {
-            if ($this->organizedNodeParents[$node->getIdentifier()] !== $node->getParent() && $this->organizedNodeParents[$node->getIdentifier()]->getNode($node->getName()) !== null) {
-                return true;
-            }
-
-            $node->moveInto($this->organizedNodeParents[$node->getIdentifier()]);
-            $this->logger->info(sprintf('Path of affected node %s was restored', $node->getPath()), LogEnvironment::fromMethodName(__METHOD__));
-            return true;
+        if (empty($moveNodeProperties)) {
+            return null;
         }
 
-        if (isset($this->sortedNodeInstructions[$node->getIdentifier()])) {
-            $this->sortingService->sortChildren($node, $this->sortedNodeInstructions[$node->getIdentifier()], null);
-            return true;
-        }
-
-        return false;
+        return MoveNodeAggregate::create(
+            $contentSubgraph->getWorkspaceName(),
+            $contentSubgraph->getDimensionSpacePoint(),
+            $affectedNodeAggregateId,
+            RelationDistributionStrategy::default(),
+            newParentNodeAggregateId: $moveNodeProperties['newParentNodeAggregateId'] ?? null,
+            newPrecedingSiblingNodeAggregateId: $moveNodeProperties['newPrecedingSiblingNodeAggregateId'] ?? null,
+            newSucceedingSiblingNodeAggregateId: $moveNodeProperties['newSucceedingSiblingNodeAggregateId'] ?? null,
+        );
     }
 
-    /**
-     * @param NodeInterface $node
-     * @return bool
-     */
-    public function isNodeInProcess(NodeInterface $node): bool
+    public function isNodeInProcess(NodeAggregateId $nodeAggregateId): bool
     {
-        return isset($this->nodesInProcessing[$node->getIdentifier()]);
+        return isset($this->nodesInProcessing[$nodeAggregateId->value]);
     }
 
-    /**
-     * @param NodeInterface $node
-     */
-    protected function lockNodeForProcessing(NodeInterface $node): void
+    protected function lockNodeForProcessing(NodeAggregateId $nodeAggregateId): void
     {
-        $this->nodesInProcessing[$node->getIdentifier()] = true;
+        $this->nodesInProcessing[$nodeAggregateId->value] = true;
     }
 
-    /**
-     * @param NodeInterface $node
-     */
-    protected function releaseNodeProcessingLock(NodeInterface $node): void
+    protected function releaseNodeProcessingLock(NodeAggregateId $nodeAggregateId): void
     {
-        unset($this->nodesInProcessing[$node->getIdentifier()]);
+        unset($this->nodesInProcessing[$nodeAggregateId->value]);
     }
 
     /**
-     * @param NodeInterface $node
-     * @param array $sortingInstructions
-     * @return array
      * @throws ArchivistConfigurationException
      * @throws \Neos\Eel\Exception
      */
-    protected function buildBaseContext(NodeInterface $node, array $sortingInstructions): array
+    protected function buildBaseContext(ContentSubgraphInterface $contentSubgraph, Node $node, array $sortingInstructions): array
     {
         $context = [
-            'documentNode' => (new FlowQuery([$node]))->closest('[instanceof Neos.Neos:Document]')->get(0),
-            'site' => (new FlowQuery([$node]))->parents('[instanceof Neos.Neos:Document]')->last()->get(0),
+            'documentNode' => $contentSubgraph->findClosestNode($node->aggregateId, FindClosestNodeFilter::create('Neos.Neos:Document')),
+            'site' => $contentSubgraph->findClosestNode($node->aggregateId, FindClosestNodeFilter::create('Neos.Neos:Site')),
             'node' => $node
         ];
 
@@ -236,7 +179,7 @@ class Archivist
         }
 
         $hierarchyRoot = $this->eelEvaluationService->evaluateIfValidEelExpression($sortingInstructions['hierarchyRoot'], $context);
-        if (!($hierarchyRoot instanceof NodeInterface)) {
+        if (!($hierarchyRoot instanceof Node)) {
             throw new ArchivistConfigurationException('The hierarchyRoot node defined was not found.', 1516348968);
         }
 
@@ -260,26 +203,15 @@ class Archivist
         return $customContext;
     }
 
-    /**
-     * @param NodeInterface $hierarchyNode
-     * @param NodeInterface $affectedNode
-     * @param string $oldContextPath
-     * @param string $newContextPath
-     */
-    private function sendNodeMovedFeedback(NodeInterface $hierarchyNode, NodeInterface $affectedNode, string $oldContextPath, string $newContextPath): void
+    public function sendNodeMovedFeedback(Node|null $node): void
     {
-        $updateNodeInfo = new UpdateNodeInfo();
-        $updateNodeInfo->setNode($hierarchyNode);
-        $this->feedbackCollection->add($updateNodeInfo);
+        if ($node === null) {
+            return;
+        }
 
         $updateNodeInfo = new UpdateNodeInfo();
-        $updateNodeInfo->setNode($affectedNode);
+        $updateNodeInfo->setNode($node);
         $this->feedbackCollection->add($updateNodeInfo);
-
-        $updateNodePath = new UpdateNodePath();
-        $updateNodePath->setOldContextPath($oldContextPath);
-        $updateNodePath->setNewContextPath($newContextPath);
-        $this->feedbackCollection->add($updateNodePath);
     }
 }
 

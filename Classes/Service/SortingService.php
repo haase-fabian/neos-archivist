@@ -11,27 +11,22 @@ namespace PunktDe\Archivist\Service;
  * source code.
  */
 
+use Neos\ContentRepository\Core\NodeType\NodeType;
+use Neos\ContentRepository\Core\Projection\ContentGraph\ContentSubgraphInterface;
+use Neos\ContentRepository\Core\Projection\ContentGraph\Filter\FindChildNodesFilter;
+use Neos\ContentRepository\Core\SharedModel\Node\NodeAggregateId;
+use Neos\Eel\Exception;
 use Neos\Flow\Annotations as Flow;
-use Neos\ContentRepository\Domain\Model\NodeInterface;
 
-/**
- * @Flow\Scope("singleton")
- */
 class SortingService
 {
-    /**
-     * @Flow\Inject
-     * @var EelEvaluationService
-     */
-    protected $eelEvaluationService;
+    #[Flow\Inject]
+    protected EelEvaluationService $eelEvaluationService;
 
     /**
-     * @param NodeInterface $nodeToBeSorted
-     * @param string $eelOrProperty
-     * @param string $nodeTypeFilter
-     * @throws \Neos\Eel\Exception
+     * @throws Exception
      */
-    public function sortChildren(NodeInterface $nodeToBeSorted, string $eelOrProperty, $nodeTypeFilter)
+    public function sortChildren(ContentSubgraphInterface $contentSubgraph, NodeAggregateId $parentNodeAggregateId, NodeAggregateId $nodeToBeSorted, string $eelOrProperty, ?NodeType $nodeTypeFilter): array
     {
         if ($this->eelEvaluationService->isValidExpression($eelOrProperty)) {
             $eelExpression = $eelOrProperty;
@@ -39,24 +34,57 @@ class SortingService
             $eelExpression = sprintf('${String.toLowerCase(q(a).property("%s")) < String.toLowerCase(q(b).property("%s"))}', $eelOrProperty, $eelOrProperty);
         }
 
-        $this->moveNodeToCorrectPosition($nodeToBeSorted, $eelExpression, $nodeTypeFilter);
+        return $this->moveNodeToCorrectPosition($contentSubgraph, $parentNodeAggregateId, $nodeToBeSorted, $eelExpression, $nodeTypeFilter);
     }
 
     /**
-     * @param NodeInterface $nodeToBeSorted
-     * @param string $eelExpression
-     * @param $nodeTypeFilter
-     * @throws \Neos\Eel\Exception
+     * @throws Exception
      */
-    protected function moveNodeToCorrectPosition(NodeInterface $nodeToBeSorted, string $eelExpression, $nodeTypeFilter)
+    protected function moveNodeToCorrectPosition(ContentSubgraphInterface $contentSubgraph, NodeAggregateId $parentNodeAggregateId, NodeAggregateId $nodeAggregateIdToBeSorted, string $eelExpression, ?NodeType $nodeTypeFilter): array
     {
-        $nodes = $nodeToBeSorted->getParent()->getChildNodes($nodeTypeFilter);
+        if (!$parentNode = $contentSubgraph->findNodeById($parentNodeAggregateId)) {
+            return [];
+        }
 
-        foreach ($nodes as $node) {
-            if ($this->eelEvaluationService->evaluate($eelExpression, ['a' => $nodeToBeSorted, 'b' => $node])) {
-                $nodeToBeSorted->moveBefore($node);
-                break;
+        $nodeToBeSorted = $contentSubgraph->findNodeById($nodeAggregateIdToBeSorted);
+        $nodes = $contentSubgraph->findChildNodes($parentNode->aggregateId, FindChildNodesFilter::create($nodeTypeFilter?->name->value ?? 'Neos.Neos:Document'));
+
+        $count = $nodes->count();
+        for ($i = 0; $i < $count; $i++) {
+            $currentNode = $nodes->offsetGet($i);
+            if ($currentNode?->aggregateId === $nodeToBeSorted?->aggregateId) {
+
+                $node = $nodes->offsetGet($i - 1);
+                if ($node !== null && $this->eelEvaluationService->evaluate($eelExpression, ['a' => $nodeToBeSorted, 'b' => $node])) {
+                    break; // nodeToBeSorted should come before its preceding node
+                }
+
+                $node = $nodes->offsetGet($i + 1);
+                if ($node !== null && $this->eelEvaluationService->evaluate($eelExpression, ['a' => $node, 'b' => $nodeToBeSorted])) {
+                    break; // nodeToBeSorted should come after its succeeding node
+                }
+
+                return []; // nodeToBeSorted is already at the correct position
             }
         }
+
+
+        for ($i = 0; $i < $count; $i++) {
+            $newPrecedingSiblingNode = $nodes->offsetGet($i - 1);
+            $newSucceedingSiblingNode = $nodes->offsetGet($i);
+
+            if ($newSucceedingSiblingNode === $nodeToBeSorted || $newPrecedingSiblingNode === $nodeToBeSorted) {
+                continue;
+            }
+
+            if ($this->eelEvaluationService->evaluate($eelExpression, ['a' => $nodeToBeSorted, 'b' => $newSucceedingSiblingNode])) {
+                return array_filter([
+                    'newPrecedingSiblingNodeAggregateId' => $newPrecedingSiblingNode?->aggregateId,
+                    'newSucceedingSiblingNodeAggregateId' => $newSucceedingSiblingNode?->aggregateId,
+                ]);
+            }
+        }
+
+        return [];
     }
 }

@@ -4,8 +4,8 @@
     "name": "punktde/archivist",
     "license": "MIT",
     "require": {
-        "php": "^7.2 || ^8.0",
-        "neos/neos": "^5.0 || ^7.0 || ^8.0 || dev-master",
+        "php": "^8.0",
+        "neos/neos": "^9.0 || dev-master",
         "neos/neos-ui": "*",
         "neos/neos-ui-compiled": "*",
         "behat/transliterator": "*"
